@@ -1,14 +1,14 @@
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
-@dataclass(frozen=True)
-class Document:
-    id: str
-    text: str
-    metadata: dict[str, Any] = field(default_factory=dict)
+from langchain_core.documents import Document
+
 
 @dataclass(frozen=True)
 class RetrievedDocument:
     document: Document
     score: float
-    source: str = 'dense'
+    source: str = "dense"
+
+
+Metadata = dict[str, Any]
