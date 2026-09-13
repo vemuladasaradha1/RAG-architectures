@@ -1,7 +1,19 @@
 # Architecture overview
 
-All 16 architectures share: ingest → parse → chunk → index → retrieve → optional transform/rerank/verify → generate → evaluate.
+All 16 examples share the same explicit LangChain-oriented end-to-end lifecycle:
 
-The learning goal is to change one stage at a time and measure it. Hybrid combines sparse + semantic retrieval. Reranking improves ordering. Multi-query and HyDE transform queries. Parent-child and hierarchical designs improve context selection. Multi-hop, graph, corrective, self-reflective, adaptive and agentic designs add iterative reasoning or control flow.
+**ingest → parse → chunk → index → retrieve → optional transform / rerank / verify → generate → evaluate**
 
-For each notebook ask: What problem does it solve? What does it change? What does it cost? How does it fail? How should it be evaluated?
+The variation is deliberately isolated:
+
+- Basic and Dense: baseline vector retrieval.
+- Sparse: BM25 lexical retrieval.
+- Hybrid: dense + sparse fusion.
+- Reranking: broad candidate retrieval followed by relevance ordering.
+- Multi-query and HyDE: query transformation before retrieval.
+- Contextual, Parent-child and Hierarchical: context selection and expansion.
+- Multi-hop and GraphRAG: iterative or relationship-aware retrieval.
+- Corrective and Self-RAG: verification/reflection around evidence.
+- Adaptive and Agentic: routing and orchestration across retrieval actions.
+
+Every notebook makes all lifecycle stages visible so learners can compare what changes, what it costs, and where an architecture can fail.
