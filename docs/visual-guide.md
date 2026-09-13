@@ -1,17 +1,17 @@
 # RAG Architectures Visual Guide
 
-The complete visual guide covers all 16 architectures and is intended as a companion to the architecture notebooks.
+The complete visual guide accompanies the 16 architecture notebooks.
 
-## Canonical pipeline
-
-Every architecture should be understood through the common lifecycle:
+Every notebook now follows the same explicit lifecycle:
 
 **ingest → parse → chunk → index → retrieve → optional transform / rerank / verify → generate → evaluate**
 
-The architecture-specific differences happen mainly during retrieval and the optional transform/rerank/verify stage; ingestion, parsing, chunking, indexing, generation, and evaluation remain explicit parts of the end-to-end system.
+The architecture-specific logic changes mainly in retrieval and the optional control stages, while the other stages remain explicit and testable.
 
-## Visual asset
+Visual asset:
 
-- `../assets/rag-architectures-complete-visual-guide.jpg`
+`../assets/rag-architectures-complete-visual-guide.jpg`
 
-Use the visual guide together with the corresponding notebook in `notebooks/` for the implementation walkthrough.
+Data source used by the notebooks:
+
+`../data/sample/mtech_quantum_project.html`
