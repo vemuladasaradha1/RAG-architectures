@@ -1,8 +1,12 @@
 # RAG Architectures
 
-A local-first, open-source learning and production reference for 16 Retrieval-Augmented Generation architectures. Every architecture has both a reusable Python implementation and a dedicated Jupyter notebook.
+A LangChain-based learning and engineering repository that implements 16 major RAG architecture patterns around one explicit lifecycle:
 
-## Architectures
+**ingest → parse → chunk → index → retrieve → optional transform / rerank / verify → generate → evaluate**
+
+The notebooks use `data/sample/mtech_quantum_project.html` as the canonical offline corpus. Each notebook exposes the common pipeline and then highlights the architecture-specific behavior.
+
+## 16 architectures
 
 1. Basic RAG
 2. Dense / semantic RAG
@@ -16,32 +20,25 @@ A local-first, open-source learning and production reference for 16 Retrieval-Au
 10. Hierarchical RAG
 11. Multi-hop RAG
 12. GraphRAG
-13. Corrective RAG
+13. Corrective RAG (CRAG)
 14. Self-RAG
 15. Adaptive RAG
 16. Agentic RAG
 
-## Local-first and API-key free
+## LangChain stack
 
-The core examples use a dependency-light in-memory backend and a deterministic extractive generator, so **no API key is required**. For realistic experiments, the notebooks show optional upgrades to local open-weight Transformers models, Qdrant/FAISS, BM25, rerankers, LangGraph, and GraphRAG. Public model downloads may require internet access, but not a paid API key.
+The repository is built on LangChain 1.x. It uses LangChain Core documents, runnable pipelines, vector-store abstractions, LangChain text splitters, and the Community BM25 retriever. LangChain's HTML header splitter and recursive splitter are used for parse/chunk stages; `InMemoryVectorStore` handles the offline index; and a `RunnableLambda` provides a deterministic offline generator. This keeps every notebook executable without API keys while leaving clean seams for local open-weight models and production vector databases.
 
-## Notebooks
+## Data source
 
-Each notebook is deliberately modular: run the cells top-to-bottom, or replace individual components (loader, chunker, retriever, reranker, generator, evaluator) independently. The notebook uses the same package modules as the application to prevent notebook-only code drift.
+`data/sample/mtech_quantum_project.html` is a repository copy derived from the user-supplied M.Tech Quantum ML project HTML and is used by all 16 notebooks as the retrieval corpus.
 
-## Quick start
+## Run
 
 ```bash
-python -m venv .venv
-# Windows: .venv\\Scripts\\activate
-# Linux/macOS: source .venv/bin/activate
-pip install -e '.[notebooks,dev]'
-pytest
-jupyter lab
+python -m pip install -e ".[dev,notebooks]"
+pytest -q
+jupyter nbconvert --to notebook --execute --inplace notebooks/*.ipynb
 ```
 
-## Production direction
-
-Use Qdrant/FAISS for vector search, BM25/OpenSearch for sparse retrieval, a cross-encoder reranker, a local vLLM or llama.cpp model server, FastAPI for serving, Docker for packaging, and an evaluation set with retrieval and generation metrics. The demo backend intentionally stays lightweight so the learning notebooks work on a CPU without credentials.
-
-See `docs/` for architecture decisions and `docs/deployment.md` for the production upgrade path.
+For real semantic embeddings and model inference, use the production extras and replace the offline `HashEmbeddings` and deterministic generator with local open-weight models.
