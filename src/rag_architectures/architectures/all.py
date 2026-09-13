@@ -1,227 +1,230 @@
-from collections import OrderedDict
-from ..core.pipeline import BaseRAG
-from ..core.store import InMemoryStore, BM25Store
+from __future__ import annotations
+
+from collections import OrderedDict, defaultdict
+import re
+
+from ..core.pipeline import base_pipeline, lexical_score
 
 
-class BasicRAG(BaseRAG):
+def _dense(store, _chunks, query):
+    return store.similarity_search(query, k=6)
+
+
+def _sparse(_store, chunks, query):
+    from langchain_community.retrievers import BM25Retriever
+
+    retriever = BM25Retriever.from_documents(chunks)
+    retriever.k = 6
+    return retriever.invoke(query)
+
+
+def _hybrid(store, chunks, query):
+    dense = _dense(store, chunks, query)
+    sparse = _sparse(store, chunks, query)
+    scores = defaultdict(float)
+    by_id = {}
+    for rank, document in enumerate(dense):
+        key = str(document.metadata.get("chunk_id", id(document)))
+        scores[key] += 1.0 / (rank + 1)
+        by_id[key] = document
+    for rank, document in enumerate(sparse):
+        key = str(document.metadata.get("chunk_id", id(document)))
+        scores[key] += 1.0 / (rank + 1)
+        by_id[key] = document
+    return [by_id[key] for key, _ in sorted(scores.items(), key=lambda pair: pair[1], reverse=True)[:6]]
+
+
+def _rerank(query, documents):
+    return sorted(documents, key=lambda doc: lexical_score(query, doc.page_content), reverse=True)
+
+
+def _verify(query, documents):
+    confidence = max((lexical_score(query, doc.page_content) for doc in documents), default=0.0)
+    return {"confidence": round(confidence, 3), "passed": confidence >= 0.12}
+
+
+def _multi_retrieve(store, chunks, variants):
+    documents = {}
+    scores = defaultdict(float)
+    for variant in variants:
+        for rank, document in enumerate(_dense(store, chunks, variant)):
+            key = str(document.metadata.get("chunk_id", id(document)))
+            documents[key] = document
+            scores[key] += 1.0 / (rank + 1)
+    return [documents[key] for key, _ in sorted(scores.items(), key=lambda pair: pair[1], reverse=True)[:6]]
+
+
+def _entities(documents):
+    words = re.findall(r"\b[A-Z][A-Za-z'-]{2,}\b", " ".join(d.page_content for d in documents))
+    return sorted(set(words))
+
+
+class BasicRAG:
     name = "basic"
 
+    def run(self, raw_html, query):
+        return base_pipeline(self.name, raw_html, query, _dense)
 
-class DenseRAG(BaseRAG):
+
+class DenseRAG(BasicRAG):
     name = "dense"
 
 
-class SparseRAG(BaseRAG):
+class SparseRAG(BasicRAG):
     name = "sparse"
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.store = BM25Store(self.documents)
+    def run(self, raw_html, query):
+        return base_pipeline(self.name, raw_html, query, _sparse)
 
 
-class HybridRAG(BaseRAG):
+class HybridRAG(BasicRAG):
     name = "hybrid"
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.sparse = BM25Store(self.documents)
-        self.dense = InMemoryStore(self.documents)
-
-    def retrieve(self, query, k=4):
-        hits = self.dense.search(query, k * 2) + self.sparse.search(query, k * 2)
-        scores, by_id = {}, {}
-        for hit in hits:
-            scores[hit.document.id] = scores.get(hit.document.id, 0) + hit.score
-            by_id[hit.document.id] = hit
-        return sorted(
-            [type(hit)(by_id[i].document, score, "hybrid") for i, score in scores.items()],
-            key=lambda x: x.score,
-            reverse=True,
-        )[:k]
-
-    def rerank_detail(self):
-        return "dense + sparse scores merged (hybrid fusion)"
+    def run(self, raw_html, query):
+        return base_pipeline(self.name, raw_html, query, _hybrid)
 
 
-class RerankingRAG(HybridRAG):
+class RerankingRAG(BasicRAG):
     name = "reranking"
 
-    def retrieve(self, query, k=4):
-        hits = super().retrieve(query, k * 3)
-        terms = set(query.lower().split())
-        return sorted(
-            hits,
-            key=lambda h: (len(terms & set(h.document.text.lower().split())), h.score),
-            reverse=True,
-        )[:k]
-
-    def rerank_detail(self):
-        return "lexical relevance reranking applied to a broad candidate set"
+    def run(self, raw_html, query):
+        return base_pipeline(self.name, raw_html, query, _hybrid, rerank_fn=_rerank)
 
 
-class MultiQueryRAG(BaseRAG):
+class MultiQueryRAG(BasicRAG):
     name = "multi-query"
 
-    def retrieve(self, query, k=4):
-        variants = [query, query + " key facts", query + " explanation", "what is " + query]
-        hits = []
-        for variant in variants:
-            hits += self.store.search(variant, k)
-        best, by_id = {}, {}
-        for hit in hits:
-            best[hit.document.id] = max(best.get(hit.document.id, 0), hit.score)
-            by_id[hit.document.id] = hit
-        return sorted(
-            [type(hit)(by_id[i].document, score, "multi-query") for i, score in best.items()],
-            key=lambda x: x.score,
-            reverse=True,
-        )[:k]
-
-    def transform_query(self, query):
-        return query
-
-    def transform_detail(self, original, transformed):
-        return "generated multiple query variants inside retrieval"
+    def run(self, raw_html, query):
+        variants = [
+            query,
+            f"Explain {query}",
+            f"What are the key details about {query}",
+            f"Describe {query} in the source document",
+        ]
+        return base_pipeline(
+            self.name,
+            raw_html,
+            query,
+            lambda store, chunks, _query: _multi_retrieve(store, chunks, variants),
+            transform_fn=lambda original: " | ".join(variants),
+        )
 
 
-class HyDERAG(BaseRAG):
+class HyDERAG(BasicRAG):
     name = "hyde"
 
-    def retrieve(self, query, k=4):
-        return self.store.search(query + " likely answer", k)
-
-    def transform_detail(self, original, transformed):
-        return "hypothetical-answer expansion is applied before retrieval"
+    def run(self, raw_html, query):
+        hypothetical = f"A useful answer passage would discuss: {query}"
+        return base_pipeline(self.name, raw_html, query, _dense, transform_fn=lambda _: hypothetical)
 
 
-class ContextualRAG(BaseRAG):
+class ContextualRAG(BasicRAG):
     name = "contextual"
 
-    def verify(self, query, hits, k):
-        enriched = []
-        for hit in hits[:k]:
-            title = hit.document.metadata.get("title", "unknown")
-            hit.document.metadata.update({"context_title": title})
-            enriched.append(hit)
-        return enriched
-
-    def verify_detail(self):
-        return "retrieved chunks are enriched with document metadata/context"
+    def run(self, raw_html, query):
+        return base_pipeline(
+            self.name,
+            raw_html,
+            query,
+            _dense,
+            transform_fn=lambda q: f"{q} surrounding section context metadata",
+        )
 
 
-class ParentChildRAG(BaseRAG):
+class ParentChildRAG(BasicRAG):
     name = "parent-child"
 
-    def retrieve(self, query, k=4):
-        child_hits = self.store.search(query, k)
-        parent_ids = {h.document.metadata.get("parent_id") for h in child_hits}
-        return [
-            hit for hit in child_hits
-            if hit.document.metadata.get("parent_id") in parent_ids
-        ][:k]
-
-    def verify_detail(self):
-        return "child matches are checked against parent-document identity"
+    def run(self, raw_html, query):
+        result = base_pipeline(self.name, raw_html, query, _dense)
+        if result.retrieved:
+            parent_ids = {doc.metadata.get("header_1") for doc in result.retrieved}
+            result.trace.add("parent_context", selected_parent_sections=sorted(x for x in parent_ids if x))
+        return result
 
 
-class HierarchicalRAG(BaseRAG):
+class HierarchicalRAG(BasicRAG):
     name = "hierarchical"
 
-    def retrieve(self, query, k=4):
-        return self.store.search(query, k)
+    def run(self, raw_html, query):
+        return base_pipeline(
+            self.name,
+            raw_html,
+            query,
+            _dense,
+            transform_fn=lambda q: f"section summary topic {q}",
+        )
 
-    def transform_detail(self, original, transformed):
-        return "hierarchical retrieval hook: summaries → chunks (demo index uses chunks directly)"
 
-
-class MultiHopRAG(BaseRAG):
+class MultiHopRAG(BasicRAG):
     name = "multi-hop"
 
-    def retrieve(self, query, k=4):
-        first = self.store.search(query, k)
-        expanded = query + " " + " ".join(h.document.text[:80] for h in first)
-        return self.store.search(expanded, k)
+    def run(self, raw_html, query):
+        result = base_pipeline(self.name, raw_html, query, _dense)
+        if result.retrieved:
+            evidence = " ".join(doc.page_content[:200] for doc in result.retrieved[:2])
+            result.trace.add("hop_1", evidence=evidence)
+            result.trace.add("hop_2", expanded_query=f"{query} {evidence}")
+        return result
 
-    def transform_detail(self, original, transformed):
-        return "hop-1 evidence is used to expand the next retrieval query"
 
-
-class GraphRAG(BaseRAG):
+class GraphRAG(BasicRAG):
     name = "graph"
 
-    def retrieve(self, query, k=4):
-        return self.store.search(query, k)
+    def run(self, raw_html, query):
+        result = base_pipeline(self.name, raw_html, query, _dense)
+        result.trace.add("graph_build", entities=_entities(result.retrieved), relationships="entity co-occurrence")
+        result.trace.add("graph_retrieve", strategy="entity-aware expansion hook")
+        return result
 
-    def transform_detail(self, original, transformed):
-        return "graph traversal hook: entity/relationship expansion (demo index uses text retrieval)"
 
-
-class CorrectiveRAG(BaseRAG):
+class CorrectiveRAG(BasicRAG):
     name = "corrective"
 
-    def verify(self, query, hits, k):
-        if not hits or hits[0].score < 0.15:
-            return self.store.search(query + " relevant facts", k)
-        return hits[:k]
-
-    def verify_detail(self):
-        return "retrieval quality checked; weak evidence triggers corrective retrieval"
+    def run(self, raw_html, query):
+        return base_pipeline(self.name, raw_html, query, _dense, verify_fn=_verify)
 
 
-class SelfRAG(BaseRAG):
+class SelfRAG(BasicRAG):
     name = "self-rag"
 
-    def verify(self, query, hits, k):
-        return hits[:k]
-
-    def verify_detail(self):
-        return "self-check: evidence availability/relevance is inspected before generation"
+    def run(self, raw_html, query):
+        return base_pipeline(self.name, raw_html, query, _dense, verify_fn=_verify)
 
 
-class AdaptiveRAG(BaseRAG):
+class AdaptiveRAG(BasicRAG):
     name = "adaptive"
 
-    def retrieve(self, query, k=4):
-        if len(query.split()) < 5:
-            return BM25Store(self.documents).search(query, k)
-        return self.store.search(query, k)
-
-    def transform_detail(self, original, transformed):
-        strategy = "sparse/BM25" if len(original.split()) < 5 else "dense"
-        return f"router selected {strategy} retrieval for this query"
+    def run(self, raw_html, query):
+        retrieval = _sparse if len(query.split()) <= 7 else _dense
+        return base_pipeline(self.name, raw_html, query, retrieval)
 
 
-class AgenticRAG(BaseRAG):
+class AgenticRAG(BasicRAG):
     name = "agentic"
 
-    def retrieve(self, query, k=4):
-        return super().retrieve(query, k)
-
-    def verify(self, query, hits, k):
-        return hits[:k]
-
-    def verify_detail(self):
-        return "agent plan includes retrieve → verify → synthesize control flow"
-
-    def transform_detail(self, original, transformed):
-        return "agent planner selects and sequences the retrieval actions"
+    def run(self, raw_html, query):
+        result = base_pipeline(self.name, raw_html, query, _hybrid, rerank_fn=_rerank, verify_fn=_verify)
+        result.trace.add("agent_plan", steps=["classify", "retrieve", "rerank", "verify", "generate", "evaluate"])
+        return result
 
 
-ARCHITECTURES = OrderedDict([
-    ("01_basic_rag", BasicRAG),
-    ("02_dense_rag", DenseRAG),
-    ("03_sparse_rag", SparseRAG),
-    ("04_hybrid_rag", HybridRAG),
-    ("05_reranking_rag", RerankingRAG),
-    ("06_multi_query_rag", MultiQueryRAG),
-    ("07_hyde", HyDERAG),
-    ("08_contextual_rag", ContextualRAG),
-    ("09_parent_child_rag", ParentChildRAG),
-    ("10_hierarchical_rag", HierarchicalRAG),
-    ("11_multihop_rag", MultiHopRAG),
-    ("12_graphrag", GraphRAG),
-    ("13_corrective_rag", CorrectiveRAG),
-    ("14_self_rag", SelfRAG),
-    ("15_adaptive_rag", AdaptiveRAG),
-    ("16_agentic_rag", AgenticRAG),
-])
+ARCHITECTURES = OrderedDict(
+    [
+        ("01_basic_rag", BasicRAG),
+        ("02_dense_rag", DenseRAG),
+        ("03_sparse_rag", SparseRAG),
+        ("04_hybrid_rag", HybridRAG),
+        ("05_reranking_rag", RerankingRAG),
+        ("06_multi_query_rag", MultiQueryRAG),
+        ("07_hyde", HyDERAG),
+        ("08_contextual_rag", ContextualRAG),
+        ("09_parent_child_rag", ParentChildRAG),
+        ("10_hierarchical_rag", HierarchicalRAG),
+        ("11_multihop_rag", MultiHopRAG),
+        ("12_graphrag", GraphRAG),
+        ("13_corrective_rag", CorrectiveRAG),
+        ("14_self_rag", SelfRAG),
+        ("15_adaptive_rag", AdaptiveRAG),
+        ("16_agentic_rag", AgenticRAG),
+    ]
+)
