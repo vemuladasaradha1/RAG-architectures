@@ -1,10 +1,23 @@
-from rag_architectures.core.pipeline import docs_from_pairs
+from pathlib import Path
+
 from rag_architectures.architectures.all import ARCHITECTURES
 
-DOCS=docs_from_pairs([('RAG','Retrieval augmented generation retrieves evidence before generation.'),('Graph','Knowledge graphs connect entities and relationships.')])
+
+DATA_PATH = Path("data/sample/mtech_quantum_project.html")
+
 
 def test_every_architecture_runs():
-    for name, cls in ARCHITECTURES.items():
-        result=cls(DOCS).run('What does retrieval augmented generation retrieve?')
+    raw_html = DATA_PATH.read_text(encoding="utf-8")
+    assert len(ARCHITECTURES) == 16
+
+    for cls in ARCHITECTURES.values():
+        result = cls().run(
+            raw_html,
+            "What are the key implementation steps and expected outcomes in the M.Tech project?",
+        )
+        stages = [item["stage"] for item in result.trace.stages]
+        assert stages[:4] == ["ingest", "parse", "chunk", "index"]
+        assert "retrieve" in stages
+        assert "generate" in stages
+        assert "evaluate" in stages
         assert result.answer
-        assert result.trace['architecture']
