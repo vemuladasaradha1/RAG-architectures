@@ -1,158 +1,156 @@
-from dataclasses import dataclass
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+import hashlib
+import math
 import re
-from .store import InMemoryStore
-from .types import Document
+from typing import Any
+
+from langchain_core.documents import Document
+from langchain_core.embeddings import Embeddings
+from langchain_core.runnables import RunnableLambda
+from langchain_core.vectorstores import InMemoryVectorStore
+from langchain_text_splitters import HTMLHeaderTextSplitter, RecursiveCharacterTextSplitter
 
 
-class DemoLLM:
-    """API-key-free deterministic generator; swap for a local open-weight model."""
+class HashEmbeddings(Embeddings):
+    """Deterministic offline embeddings for reproducible notebooks and CI."""
 
-    def generate(self, question, contexts):
-        if not contexts:
-            return "I could not find supporting context."
-        words = {w for w in re.findall(r"\w+", question.lower()) if len(w) > 3}
-        hits = []
-        for context in contexts:
-            hits += [
-                sentence.strip()
-                for sentence in re.split(r"(?<=[.!?])\s+", context.text)
-                if any(word in sentence.lower() for word in words)
-            ]
-        return " ".join(hits[:3]) or contexts[0].text
+    def __init__(self, dimensions: int = 256) -> None:
+        self.dimensions = dimensions
+
+    def _embed(self, text: str) -> list[float]:
+        vector = [0.0] * self.dimensions
+        for token in re.findall(r"[a-z0-9]+", text.lower()):
+            digest = hashlib.sha256(token.encode("utf-8")).digest()
+            for offset in range(0, min(8, len(digest) - 1), 2):
+                index = int.from_bytes(digest[offset : offset + 2], "little") % self.dimensions
+                vector[index] += 1.0 if digest[offset] % 2 else -1.0
+        norm = math.sqrt(sum(value * value for value in vector)) or 1.0
+        return [value / norm for value in vector]
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        return [self._embed(text) for text in texts]
+
+    def embed_query(self, text: str) -> list[float]:
+        return self._embed(text)
+
+
+@dataclass
+class PipelineTrace:
+    architecture: str
+    stages: list[dict[str, Any]] = field(default_factory=list)
+
+    def add(self, stage: str, **details: Any) -> None:
+        self.stages.append({"stage": stage, **details})
 
 
 @dataclass
 class RAGResult:
     answer: str
-    retrieved: list
-    trace: dict
+    retrieved: list[Document]
+    trace: PipelineTrace
+    evaluation: dict[str, float]
 
 
-def ingest_documents(documents):
-    """Stage 1: accept source documents into the RAG pipeline."""
-    return [doc if isinstance(doc, Document) else Document(str(i), str(doc)) for i, doc in enumerate(documents)]
+def ingest_html(path: str) -> str:
+    with open(path, encoding="utf-8") as handle:
+        return handle.read()
 
 
-def parse_documents(documents):
-    """Stage 2: normalize parsed document text."""
-    parsed = []
-    for doc in documents:
-        text = re.sub(r"\s+", " ", doc.text).strip()
-        parsed.append(Document(doc.id, text, dict(doc.metadata)))
-    return parsed
+def parse_html(raw_html: str) -> list[Document]:
+    splitter = HTMLHeaderTextSplitter(
+        headers_to_split_on=[
+            ("h1", "header_1"),
+            ("h2", "header_2"),
+            ("h3", "header_3"),
+            ("h4", "header_4"),
+        ]
+    )
+    documents = splitter.split_text(raw_html)
+    return documents or [Document(page_content=raw_html, metadata={})]
 
 
-def chunk_documents(documents, chunk_size=80, overlap=15):
-    """Stage 3: split documents into overlapping retrieval chunks."""
-    chunks = []
-    step = max(1, chunk_size - overlap)
-    for doc in documents:
-        words = doc.text.split()
-        if not words:
-            continue
-        for start in range(0, len(words), step):
-            part = words[start:start + chunk_size]
-            if not part:
-                break
-            metadata = dict(doc.metadata)
-            metadata.update({"parent_id": doc.id, "chunk_index": len(chunks)})
-            chunks.append(Document(f"{doc.id}:chunk:{start}", " ".join(part), metadata))
-            if start + chunk_size >= len(words):
-                break
+def chunk_documents(
+    documents: list[Document], chunk_size: int = 700, chunk_overlap: int = 100
+) -> list[Document]:
+    splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+    chunks = splitter.split_documents(documents)
+    for index, document in enumerate(chunks):
+        document.metadata = {**document.metadata, "chunk_id": index}
     return chunks
 
 
-def index_documents(chunks):
-    """Stage 4: build the retrieval index."""
-    return InMemoryStore(chunks)
+def build_index(documents: list[Document]) -> InMemoryVectorStore:
+    store = InMemoryVectorStore(HashEmbeddings())
+    store.add_documents(documents)
+    return store
 
 
-def evaluate_answer(question, answer, retrieved):
-    """Stage 8: lightweight deterministic evaluation for the teaching pipeline."""
-    q_terms = {w for w in re.findall(r"\w+", question.lower()) if len(w) > 3}
-    answer_terms = set(re.findall(r"\w+", answer.lower()))
-    supported_terms = set()
-    for hit in retrieved:
-        supported_terms.update(re.findall(r"\w+", hit.document.text.lower()))
-    return {
-        "retrieval_count": len(retrieved),
-        "answer_non_empty": bool(answer.strip()),
-        "grounded_term_overlap": round(
-            len(answer_terms & supported_terms) / max(1, len(answer_terms)), 3
-        ),
-        "query_coverage": round(
-            len(q_terms & answer_terms) / max(1, len(q_terms)), 3
-        ),
-    }
+def lexical_score(query: str, text: str) -> float:
+    query_tokens = set(re.findall(r"[a-z0-9]+", query.lower()))
+    text_tokens = set(re.findall(r"[a-z0-9]+", text.lower()))
+    return len(query_tokens & text_tokens) / max(1, len(query_tokens))
 
 
-def docs_from_pairs(pairs):
-    return [Document(str(i), text, {"title": title}) for i, (title, text) in enumerate(pairs)]
+def extractive_generate(question: str, contexts: list[Document]) -> str:
+    if not contexts:
+        return "I could not find supporting evidence in the supplied document."
+    terms = [token for token in re.findall(r"[a-z0-9]+", question.lower()) if len(token) > 3]
+    sentences: list[str] = []
+    for document in contexts:
+        for sentence in re.split(r"(?<=[.!?])\s+", document.page_content.strip()):
+            if any(term in sentence.lower() for term in terms):
+                sentences.append(sentence)
+    return " ".join(sentences[:4]).strip() or contexts[0].page_content[:800]
 
 
-class BaseRAG:
-    name = "base"
-    optional_stages = ("transform", "rerank", "verify")
+def evaluate_answer(answer: str, retrieved: list[Document]) -> dict[str, float]:
+    grounded = 1.0 if retrieved and answer else 0.0
+    answer_tokens = set(re.findall(r"[a-z0-9]+", answer.lower()))
+    coverage = min(1.0, len(answer_tokens) / 40.0) if answer_tokens else 0.0
+    return {"grounded": grounded, "answer_coverage": round(coverage, 3)}
 
-    def __init__(self, documents=None, llm=None):
-        self.ingested_documents = ingest_documents(list(documents or []))
-        self.parsed_documents = parse_documents(self.ingested_documents)
-        self.chunks = chunk_documents(self.parsed_documents)
-        self.documents = self.chunks
-        self.store = index_documents(self.chunks)
-        self.llm = llm or DemoLLM()
 
-    def retrieve(self, query, k=4):
-        return self.store.search(query, k)
+def base_pipeline(
+    architecture: str,
+    raw_html: str,
+    query: str,
+    retrieval_fn,
+    transform_fn=None,
+    verify_fn=None,
+    rerank_fn=None,
+) -> RAGResult:
+    trace = PipelineTrace(architecture)
+    trace.add("ingest", source="mtech_quantum_project.html")
+    parsed = parse_html(raw_html)
+    trace.add("parse", documents=len(parsed))
+    chunks = chunk_documents(parsed)
+    trace.add("chunk", chunks=len(chunks), chunk_size=700, overlap=100)
+    store = build_index(chunks)
+    trace.add("index", backend="LangChain InMemoryVectorStore")
 
-    def run(self, query, k=4):
-        transformed_query = self.transform_query(query)
-        hits = self.retrieve(transformed_query, k)
-        hits = self.rerank(transformed_query, hits, k)
-        hits = self.verify(transformed_query, hits, k)
-        answer = self.llm.generate(query, [h.document for h in hits])
-        evaluation = evaluate_answer(query, answer, hits)
-        optional = {
-            "transform": self.transform_detail(query, transformed_query),
-            "rerank": self.rerank_detail(),
-            "verify": self.verify_detail(),
-        }
-        pipeline = [
-            {"step": "ingest", "status": "complete", "detail": f"{len(self.ingested_documents)} source documents"},
-            {"step": "parse", "status": "complete", "detail": f"{len(self.parsed_documents)} parsed documents"},
-            {"step": "chunk", "status": "complete", "detail": f"{len(self.chunks)} retrieval chunks"},
-            {"step": "index", "status": "complete", "detail": type(self.store).__name__},
-            {"step": "retrieve", "status": "complete", "detail": f"{len(hits)} final candidates"},
-            {"step": "optional transform/rerank/verify", "status": "complete", "detail": optional},
-            {"step": "generate", "status": "complete", "detail": type(self.llm).__name__},
-            {"step": "evaluate", "status": "complete", "detail": evaluation},
-        ]
-        return RAGResult(
-            answer=answer,
-            retrieved=hits,
-            trace={
-                "architecture": self.name,
-                "k": k,
-                "pipeline": pipeline,
-                "optional_stages": optional,
-                "evaluation": evaluation,
-            },
-        )
+    working_query = transform_fn(query) if transform_fn else query
+    if transform_fn:
+        trace.add("transform", query=working_query)
 
-    def transform_query(self, query):
-        return query
+    retrieved = retrieval_fn(store, chunks, working_query)
+    trace.add("retrieve", count=len(retrieved))
+    if rerank_fn:
+        retrieved = rerank_fn(query, retrieved)
+        trace.add("rerank", count=len(retrieved))
+    if verify_fn:
+        verification = verify_fn(query, retrieved)
+        trace.add("verify", **verification)
 
-    def transform_detail(self, original, transformed):
-        return "skipped (query unchanged)" if original == transformed else f"{original!r} → {transformed!r}"
+    answer = extractive_generate(query, retrieved)
+    trace.add("generate", generator="LangChain RunnableLambda + deterministic extractor")
+    evaluation = evaluate_answer(answer, retrieved)
+    trace.add("evaluate", **evaluation)
+    return RAGResult(answer, retrieved, trace, evaluation)
 
-    def rerank(self, query, hits, k):
-        return hits[:k]
 
-    def rerank_detail(self):
-        return "skipped (architecture does not rerank)"
-
-    def verify(self, query, hits, k):
-        return hits[:k]
-
-    def verify_detail(self):
-        return "skipped (architecture does not verify)"
+def langchain_generator() -> RunnableLambda:
+    return RunnableLambda(
+        lambda payload: extractive_generate(payload["question"], payload["contexts"])
+    )
